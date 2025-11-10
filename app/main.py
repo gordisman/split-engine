@@ -1,219 +1,142 @@
-# Directory: app/main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-from typing import Dict, Any, Tuple
-from datetime import datetime, timezone
-import io, zipfile, hashlib, json, os
-
-# Optional parsers
-try:
-    import docx  # python-docx
-except Exception:
-    docx = None
-
-try:
-    import srt as srtlib
-except Exception:
-    srtlib = None
-
-try:
-    import webvtt
-except Exception:
-    webvtt = None
+from fastapi.responses import FileResponse
+import os
+import uuid
+import shutil
+import zipfile
+from typing import List, Dict
+from docx import Document
+import srt
+import webvtt
 
 app = FastAPI(title="Split Engine", version="0.1")
-app.state.files: Dict[str, Dict[str, Any]] = {}
 
-# Per-type caps (bytes)
-CAPS = {
-    ".txt": 10 * 1024 * 1024,
-    ".srt": 10 * 1024 * 1024,
-    ".vtt": 10 * 1024 * 1024,
-    ".docx": 25 * 1024 * 1024,
-    ".pdf": 40 * 1024 * 1024,  # For v0.2 (not enabled here)
-}
+UPLOAD_DIR = "uploads"
+OUTPUT_DIR = "outputs"
 
-# Defaults and thresholds
-DEFAULT_LINES = 250
-DEFAULT_BYTES = 200_000  # 200 KB
-MIN_MULTIPLIER = 2  # skip split if file smaller than 2x defaults
-SUPPORTED_V01 = {".txt", ".docx", ".srt", ".vtt"}
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --- Utility functions ---
+
+def save_upload_file(upload_file: UploadFile, destination: str):
+    with open(destination, "wb") as buffer:
+        shutil.copyfileobj(upload_file.file, buffer)
+    return destination
 
 
-def sha256_bytes(b: bytes) -> str:
-    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+def read_file_content(file_path: str, file_type: str) -> str:
+    if file_type == "txt":
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    elif file_type == "docx":
+        doc = Document(file_path)
+        return "\n".join([p.text for p in doc.paragraphs])
+    elif file_type == "srt":
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            subs = list(srt.parse(f.read()))
+        return "\n".join([sub.content for sub in subs])
+    elif file_type == "vtt":
+        return "\n".join([caption.text for caption in webvtt.read(file_path)])
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type")
 
 
-def ext_of(filename: str) -> str:
-    e = os.path.splitext(filename)[1].lower()
-    return e
+def split_by_lines(text: str, max_lines: int) -> List[str]:
+    lines = text.splitlines()
+    return [
+        "\n".join(lines[i:i + max_lines])
+        for i in range(0, len(lines), max_lines)
+    ]
 
 
-def enforce_caps(ext: str, size_bytes: int):
-    cap = CAPS.get(ext)
-    if cap is None:
-        raise HTTPException(415, f"Unsupported file type: {ext}")
-    if ext not in SUPPORTED_V01:
-        raise HTTPException(415, f"{ext} not supported in v0.1. Supported: .txt, .docx, .srt, .vtt")
-    if size_bytes > cap:
-        mb = cap // (1024*1024)
-        raise HTTPException(413, f"File too large for {ext} (> {mb} MB)")
+def split_by_size(text: str, max_bytes: int) -> List[str]:
+    parts = []
+    current = ""
+    for line in text.splitlines(True):
+        if len(current.encode("utf-8")) + len(line.encode("utf-8")) > max_bytes:
+            parts.append(current)
+            current = ""
+        current += line
+    if current:
+        parts.append(current)
+    return parts
 
 
-def load_text_from_upload(filename: str, data: bytes) -> str:
-    ext = ext_of(filename)
-    if ext == ".txt":
-        return data.decode("utf-8", errors="replace")
-    if ext == ".docx":
-        if docx is None:
-            raise HTTPException(500, "DOCX support not installed (python-docx)")
-        try:
-            d = docx.Document(io.BytesIO(data))
-            return "
-".join(p.text for p in d.paragraphs)
-        except Exception:
-            raise HTTPException(400, "Failed to parse .docx file")
-    if ext == ".srt":
-        if srtlib is None:
-            raise HTTPException(500, "SRT support not installed (srt)")
-        try:
-            text = data.decode("utf-8", errors="replace")
-            subs = list(srtlib.parse(text))
-            return "
+def zip_output_files(files: List[str], zip_path: str):
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for f in files:
+            zipf.write(f, os.path.basename(f))
+    return zip_path
 
-".join(s.content for s in subs)
-        except Exception:
-            raise HTTPException(400, "Failed to parse .srt file")
-    if ext == ".vtt":
-        if webvtt is None:
-            raise HTTPException(500, "VTT support not installed (webvtt-py)")
-        try:
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".vtt") as f:
-                f.write(data)
-                f.flush()
-                v = webvtt.read(f.name)
-            try:
-                os.unlink(f.name)
-            except Exception:
-                pass
-            return "
-
-".join(c.text for c in v)
-        except Exception:
-            raise HTTPException(400, "Failed to parse .vtt file")
-    raise HTTPException(415, f"Unsupported extension: {ext}")
-
+# --- Routes ---
 
 @app.get("/healthz")
-def healthz():
+def health_check():
     return {"ok": True}
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)) -> Dict[str, Any]:
-    name = file.filename or "uploaded"
-    ext = ext_of(name)
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "Empty file")
-    enforce_caps(ext, len(data))
-    text = load_text_from_upload(name, data)
-    fid = sha256_bytes(data)[:16]
-    app.state.files[fid] = {
-        "name": name,
-        "ext": ext,
-        "text": text,
-        "sha256": sha256_bytes(data),
-        "length_chars": len(text),
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-    }
-    return {"file_id": fid, "name": name, "ext": ext, "length_chars": len(text)}
+async def upload_file(file: UploadFile = File(...)):
+    ext = file.filename.split(".")[-1].lower()
+    if ext not in ["txt", "docx", "srt", "vtt"]:
+        raise HTTPException(status_code=400, detail="Unsupported file type")
 
+    limits = {"txt": 10, "srt": 10, "vtt": 10, "docx": 25}
+    max_mb = limits.get(ext, 10)
+    max_bytes = max_mb * 1024 * 1024
 
-def split_by_lines(text: str, lines_per_piece: int):
-    lines = text.splitlines(True)
-    pieces = []
-    for i in range(0, len(lines), lines_per_piece):
-        pieces.append("".join(lines[i:i+lines_per_piece]))
-    return pieces
+    contents = await file.read()
+    if len(contents) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"File too large (>{max_mb}MB)")
 
+    file_id = str(uuid.uuid4())
+    path = os.path.join(UPLOAD_DIR, f"{file_id}.{ext}")
 
-def split_by_size(text: str, bytes_per_piece: int):
-    b = text.encode("utf-8")
-    pieces = []
-    start = 0
-    while start < len(b):
-        end = min(start + bytes_per_piece, len(b))
-        pieces.append(b[start:end].decode("utf-8", errors="replace"))
-        start = end
-    return pieces
+    with open(path, "wb") as f:
+        f.write(contents)
+
+    return {"file_id": file_id, "filename": file.filename, "size": len(contents), "type": ext}
 
 
 @app.post("/split")
-async def split(payload: Dict[str, Any]):
-    fid = payload.get("file_id")
-    mode = payload.get("mode")
-    params = payload.get("params", {})
-    if not fid or fid not in app.state.files:
-        raise HTTPException(404, "file_id not found")
-    if mode not in {"lines", "size"}:
-        raise HTTPException(400, "Only 'lines' and 'size' modes are supported in v0.1")
+def split_file(
+    file_id: str,
+    mode: str,
+    lines: int = 250,
+    size: int = 200000
+):
+    # locate file
+    file_path = None
+    for f in os.listdir(UPLOAD_DIR):
+        if f.startswith(file_id):
+            file_path = os.path.join(UPLOAD_DIR, f)
+            ext = f.split(".")[-1]
+            break
+    if not file_path:
+        raise HTTPException(status_code=404, detail="File not found")
 
-    meta = app.state.files[fid]
-    text = meta["text"]
+    text = read_file_content(file_path, ext)
 
-    # Minimum-threshold logic (Option A: simple)
-    total_lines = text.count("
-") + 1
-    total_bytes = len(text.encode("utf-8"))
-
-    lines_default = int(params.get("default_lines", DEFAULT_LINES))
-    bytes_default = int(params.get("default_bytes", DEFAULT_BYTES))
-
-    too_small_for_lines = total_lines < (MIN_MULTIPLIER * lines_default)
-    too_small_for_size = total_bytes < (MIN_MULTIPLIER * bytes_default)
-
-    if (mode == "lines" and too_small_for_lines) or (mode == "size" and too_small_for_size):
-        manifest = {
-            "source": {"filename": meta["name"], "sha256": meta["sha256"], "length_chars": len(text)},
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "mode": mode,
-            "params": params,
-            "skipped_reason": "file below minimum threshold for selected mode",
-            "pieces": [{"id": "0001", "length_chars": len(text)}],
-        }
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("piece_0001.txt", text)
-            z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-        buf.seek(0)
-        return StreamingResponse(buf, media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="split-pack.zip"'})
+    # skip if small
+    if len(text) < 200:
+        return {"skipped": True, "reason": "File too small to split"}
 
     if mode == "lines":
-        n = int(params.get("lines", DEFAULT_LINES))
-        if n <= 0: raise HTTPException(400, "lines must be > 0")
-        pieces = split_by_lines(text, n)
-    else:  # size
-        sz = int(params.get("bytes", DEFAULT_BYTES))
-        if sz <= 0: raise HTTPException(400, "bytes must be > 0")
-        pieces = split_by_size(text, sz)
+        parts = split_by_lines(text, lines)
+    elif mode == "size":
+        parts = split_by_size(text, size)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid mode")
 
-    manifest = {
-        "source": {"filename": meta["name"], "sha256": meta["sha256"], "length_chars": len(text)},
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "mode": mode,
-        "params": params,
-        "pieces": [{"id": f"{i+1:04d}", "length_chars": len(p)} for i, p in enumerate(pieces)]
-    }
+    output_files = []
+    for i, chunk in enumerate(parts, start=1):
+        out_path = os.path.join(OUTPUT_DIR, f"{file_id}_part{i}.txt")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(chunk)
+        output_files.append(out_path)
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for i, p in enumerate(pieces, 1):
-            z.writestr(f"piece_{i:04d}.txt", p)
-        z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="split-pack.zip"'})
+    zip_path = os.path.join(OUTPUT_DIR, f"{file_id}_split.zip")
+    zip_output_files(output_files, zip_path)
 
-# End of file
-
+    return FileResponse(zip_path, media_type="application/zip", filename=f"{file_id}_split.zip")
