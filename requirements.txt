@@ -3,3 +3,4 @@ uvicorn[standard]
 python-docx
 srt
 webvtt-py
+python-multipart
